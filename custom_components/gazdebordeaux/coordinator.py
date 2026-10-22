@@ -1,5 +1,6 @@
 """Coordinator to handle Opower connections."""
 
+import asyncio
 import logging
 from datetime import date, datetime, timedelta
 from types import MappingProxyType
@@ -33,7 +34,12 @@ from .gazdebordeaux import DailyUsageRead, Gazdebordeaux, OffPeakTimes, TotalUsa
 _LOGGER = logging.getLogger(__name__)
 
 # Days imported hour by hour on the first import (one API request per day)
+# when the house does not tell when its load curve starts
 HOURLY_DAYS = 30
+# Life keeps the load curve for two years
+HOURLY_MAX_DAYS = 730
+# Pause between two hourly requests, to stay gentle with Life's edge filter
+HOURLY_REQUEST_DELAY = 0.2
 # Hourly data of the last days may not be published yet: wait for it
 HOURLY_GRACE_DAYS = 3
 
@@ -158,7 +164,8 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
                 )
             )
 
-        offpeak = await self.api.async_get_offpeak_times()
+        house = await self.api.async_get_house_details()
+        offpeak = house.offpeak
         hphc_ids = [statistic_id for statistic_id, _, _, hphc_only in SERIES if hphc_only]
 
         last_stat_ts = None
@@ -177,7 +184,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             _LOGGER.debug("Updating statistic for the first time")
             daily_reads = await self._async_get_all_data()
             sums = dict.fromkeys(all_ids, 0.0)
-            hourly_from = datetime.now().date() - timedelta(days=HOURLY_DAYS)
+            hourly_from = self._first_hourly_day(house.hourly_start)
         else:
             last_stat_date = datetime.fromtimestamp(last_stat_ts)
             _LOGGER.debug("Last stat found for %s...", last_stat_date.strftime("%Y-%m-%d %H:%M"))
@@ -241,9 +248,17 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             return "with peak and off-peak series"
         if self.reset:
             # The "reset statistics" option: rebuild everything, with the
-            # last HOURLY_DAYS days hour by hour
+            # load curve hour by hour
             return "on request"
         return None
+
+    @staticmethod
+    def _first_hourly_day(hourly_start: date | None) -> date:
+        """First day to import hour by hour on a full import."""
+        today = datetime.now().date()
+        if hourly_start is None:
+            return today - timedelta(days=HOURLY_DAYS)
+        return max(hourly_start, today - timedelta(days=HOURLY_MAX_DAYS))
 
     async def _async_get_all_data(self) -> list[DailyUsageRead]:
         """Get all cost reads since account activation, at different resolutions by age.
@@ -274,11 +289,15 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         """
         reads: list[DailyUsageRead] = []
         recent = datetime.now().date() - timedelta(days=HOURLY_GRACE_DAYS)
+        requested = False
         for daily in sorted(daily_reads, key=lambda r: r.date):
             day = daily.date.date()
             if day < hourly_from:
                 reads.append(daily)
                 continue
+            if requested:
+                await asyncio.sleep(HOURLY_REQUEST_DELAY)
+            requested = True
             hourly = await self.api.async_get_hourly_usage(day, offpeak if daily.isHphc else None)
             if not hourly:
                 if day >= recent:

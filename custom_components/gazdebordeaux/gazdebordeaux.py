@@ -90,6 +90,15 @@ class OffPeakTimes:
         return False
 
 
+@dataclasses.dataclass
+class HouseDetails:
+    """What the house resource tells about the electricity contract."""
+
+    offpeak: OffPeakTimes | None
+    # First day of the half-hourly load curve, if the customer enabled it
+    hourly_start: date | None
+
+
 # ----------------------------------------------------------------------------
 class Gazdebordeaux:
     def __init__(
@@ -214,23 +223,38 @@ class Gazdebordeaux:
 
         return usage_reads
 
-    async def async_get_offpeak_times(self) -> OffPeakTimes | None:
-        """Return the off-peak ranges of the selected house, if it has any."""
+    async def async_get_house_details(self) -> HouseDetails:
+        """Return the off-peak ranges and load curve start of the selected house."""
         if self._selectedHouse is None:
             await self.loadHouse()
         house = self._selectedHouse or ""
         if not house.startswith("/api/"):
             house = "/api" + (house if house.startswith("/") else "/" + house)
         data = await self._fetch_house(house)
-        if not isinstance(data, dict) or data.get("priceCategory") != "HPHC":
-            return None
-        times = OffPeakTimes(
-            all=data.get("offPeakTimes") or [],
-            high=data.get("offPeakTimesHighSeason") or [],
-            low=data.get("offPeakTimesLowSeason") or [],
-        )
-        Logger.debug("Off-peak times: %s", times)
-        return times if (times.all or (times.high and times.low)) else None
+        if not isinstance(data, dict):
+            return HouseDetails(offpeak=None, hourly_start=None)
+
+        offpeak: OffPeakTimes | None = None
+        if data.get("priceCategory") == "HPHC":
+            times = OffPeakTimes(
+                all=data.get("offPeakTimes") or [],
+                high=data.get("offPeakTimesHighSeason") or [],
+                low=data.get("offPeakTimesLowSeason") or [],
+            )
+            if times.all or (times.high and times.low):
+                offpeak = times
+
+        hourly_start: date | None = None
+        start = data.get("hourlyMeasureStartDate")
+        if isinstance(start, str):
+            try:
+                hourly_start = date.fromisoformat(start[:10])
+            except ValueError:
+                Logger.warning("Unexpected hourlyMeasureStartDate %r", start)
+
+        details = HouseDetails(offpeak=offpeak, hourly_start=hourly_start)
+        Logger.debug("House details: %s", details)
+        return details
 
     async def async_get_hourly_usage(
         self, day: date, offpeak: OffPeakTimes | None = None
