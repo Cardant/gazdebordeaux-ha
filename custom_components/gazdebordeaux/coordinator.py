@@ -29,7 +29,13 @@ from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN, HOUSE, RESET_STATISTICS
-from .gazdebordeaux import DailyUsageRead, Gazdebordeaux, OffPeakTimes, TotalUsageRead
+from .gazdebordeaux import (
+    DailyUsageRead,
+    Gazdebordeaux,
+    OffPeakTimes,
+    TotalUsageRead,
+    paris_tz,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -167,18 +173,24 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         house = await self.api.async_get_house_details()
         offpeak = house.offpeak
         hphc_ids = [statistic_id for statistic_id, _, _, hphc_only in SERIES if hphc_only]
+        has_hphc = all(i in last_stats for i in hphc_ids)
 
         last_stat_ts = None
+        rebuild = None
         if CONSUMPTION_ID in last_stats:
             last_stat_ts = last_stats[CONSUMPTION_ID][0]["start"]
-            rebuild = self._rebuild_reason(
-                last_stat_ts, offpeak is not None and not all(i in last_stats for i in hphc_ids)
-            )
+            rebuild = self._rebuild_reason(last_stat_ts, offpeak is not None and not has_hphc)
+            if rebuild is None and offpeak is None and has_hphc:
+                # Writing the other series alone would leave a hole in the
+                # peak / off-peak ones for good: wait for the ranges to come back
+                _LOGGER.warning(
+                    "No off-peak ranges for this house; skipping the update to keep "
+                    "the peak and off-peak statistics whole (reset them if the "
+                    "contract changed)"
+                )
+                return
             if rebuild:
-                _LOGGER.warning("Rebuilding Gaz de Bordeaux statistics %s", rebuild)
-                get_instance(self.hass).async_clear_statistics(all_ids)
                 last_stat_ts = None
-            self.reset = False
 
         if last_stat_ts is None:
             _LOGGER.debug("Updating statistic for the first time")
@@ -186,7 +198,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             sums = dict.fromkeys(all_ids, 0.0)
             hourly_from = self._first_hourly_day(house.hourly_start)
         else:
-            last_stat_date = datetime.fromtimestamp(last_stat_ts)
+            last_stat_date = datetime.fromtimestamp(last_stat_ts, paris_tz)
             _LOGGER.debug("Last stat found for %s...", last_stat_date.strftime("%Y-%m-%d %H:%M"))
             daily_reads = await self._async_get_recent_usage_reads(last_stat_ts)
             sums = {
@@ -205,7 +217,27 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             _LOGGER.debug("No recent usage/cost data. Skipping update")
             return
 
+        if rebuild:
+            # Only now that the new data is in hand: a failed download above
+            # leaves the existing statistics untouched. The recorder runs the
+            # clear before the imports queued below.
+            _LOGGER.warning("Rebuilding Gaz de Bordeaux statistics %s", rebuild)
+            get_instance(self.hass).async_clear_statistics(all_ids)
+
         series = [s for s in SERIES if offpeak is not None or not s[3]]
+        self._write_statistics(series, usage_reads, sums, last_stat_ts, hourly_from)
+        # Cleared once the import it asked for has happened
+        self.reset = False
+
+    def _write_statistics(
+        self,
+        series: list[tuple[str, str, str, bool]],
+        usage_reads: list[DailyUsageRead],
+        sums: dict[str, float],
+        last_stat_ts: float | None,
+        hourly_from: date,
+    ) -> None:
+        """Queue the reads after the last statistic, as running sums per series."""
         statistics: dict[str, list[StatisticData]] = {s[0]: [] for s in series}
 
         for usage_read in usage_reads:
@@ -242,7 +274,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         """Tell why the existing statistics must be cleared and imported again."""
         # Rows written before the time zone fix start at hh:51 (Paris mean
         # time): rebuild the whole series once, on the hour.
-        if datetime.fromtimestamp(last_stat_ts).minute != 0:
+        if datetime.fromtimestamp(last_stat_ts, paris_tz).minute != 0:
             return "on whole hours"
         if missing_hphc:
             return "with peak and off-peak series"
@@ -255,17 +287,16 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
     @staticmethod
     def _first_hourly_day(hourly_start: date | None) -> date:
         """First day to import hour by hour on a full import."""
-        today = datetime.now().date()
+        today = datetime.now(paris_tz).date()
         if hourly_start is None:
             return today - timedelta(days=HOURLY_DAYS)
         return max(hourly_start, today - timedelta(days=HOURLY_MAX_DAYS))
 
     async def _async_get_all_data(self) -> list[DailyUsageRead]:
-        """Get all cost reads since account activation, at different resolutions by age.
+        """Get the daily reads since January 1st of last year.
 
-        - month resolution for all years (since account activation)
-        - day resolution for past 3 years (if account's read resolution supports it)
-        - hour resolution for past 2 months (if account's read resolution supports it)
+        _async_with_hourly_reads then replaces the days covered by the load
+        curve with hourly reads.
         """
         usage_reads = []
 
@@ -288,7 +319,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         next update picks it up hour by hour once Enedis has published it.
         """
         reads: list[DailyUsageRead] = []
-        recent = datetime.now().date() - timedelta(days=HOURLY_GRACE_DAYS)
+        recent = datetime.now(paris_tz).date() - timedelta(days=HOURLY_GRACE_DAYS)
         requested = False
         for daily in sorted(daily_reads, key=lambda r: r.date):
             day = daily.date.date()
@@ -330,11 +361,11 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         return reads
 
     async def _async_get_recent_usage_reads(self, last_stat_time: float) -> list[DailyUsageRead]:
-        """Get cost reads within the past 30 days to allow corrections in data from utilities."""
+        """Get the daily reads from the day of the last statistic on."""
         return await self.api.async_get_daily_usage(
             # datetime.fromtimestamp(last_stat_time) - timedelta(days=30),
-            datetime.fromtimestamp(last_stat_time),
-            datetime.now(),
+            datetime.fromtimestamp(last_stat_time, paris_tz),
+            datetime.now(paris_tz),
         )
 
 

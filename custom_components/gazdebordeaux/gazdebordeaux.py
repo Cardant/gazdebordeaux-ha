@@ -227,10 +227,7 @@ class Gazdebordeaux:
         """Return the off-peak ranges and load curve start of the selected house."""
         if self._selectedHouse is None:
             await self.loadHouse()
-        house = self._selectedHouse or ""
-        if not house.startswith("/api/"):
-            house = "/api" + (house if house.startswith("/") else "/" + house)
-        data = await self._fetch_house(house)
+        data = await self._fetch_house(_house_api_path(self._selectedHouse))
         if not isinstance(data, dict):
             return HouseDetails(offpeak=None, hourly_start=None)
 
@@ -277,10 +274,11 @@ class Gazdebordeaux:
             return None
 
         hours: dict[datetime, DailyUsageRead] = {}
+        previous: datetime | None = None
         for key, value in data.items():
             if key == "total" or not isinstance(value, dict):
                 continue
-            point = _parse_point_time(key, day)
+            point = _parse_point_time(key, day, previous)
             if point is None:
                 sample = {k: data[k] for k in list(data)[:2]}
                 Logger.warning(
@@ -290,6 +288,7 @@ class Gazdebordeaux:
                     sample,
                 )
                 return None
+            previous = point
             point = paris_tz.normalize(point - CURVE_STEP)
             if point.date() != day:
                 continue
@@ -344,15 +343,7 @@ class Gazdebordeaux:
             if end is not None:
                 params["endDate"] = end.strftime("%Y-%m-%d")
 
-            # selectedHouse can be "/houses/{uuid}" or "/api/houses/{uuid}" depending
-            # on the account; normalize to always include the /api prefix exactly once.
-            house = self._selectedHouse or ""
-            if not house.startswith("/api/"):
-                if not house.startswith("/"):
-                    house = "/" + house
-                house = "/api" + house
-
-            url = DATA_URL.format(house)
+            url = DATA_URL.format(_house_api_path(self._selectedHouse))
             Logger.debug("Fetching data url=%s params=%s", url, params)
             async with self._session.get(
                 url, headers=headers, json=payload, params=params
@@ -447,11 +438,15 @@ _POINT_FORMATS = (
 )
 
 
-def _parse_point_time(key: str, day: date) -> datetime | None:
+def _parse_point_time(key: str, day: date, previous: datetime | None = None) -> datetime | None:
     """Turn a key of the "day" scale into an aware Paris datetime.
 
     The format is not documented; accept the usual ones and reject a bare
     date, which would mean the API answered with daily points.
+
+    Keys are local times in chronological order. On the October change the
+    02:00-03:00 hour comes twice: a time is read as summer time first, and as
+    winter time when that would not come after the previous point.
     """
     try:
         parsed = datetime.fromisoformat(key)
@@ -471,7 +466,20 @@ def _parse_point_time(key: str, day: date) -> datetime | None:
         return None
     if parsed.year == 1900:
         parsed = datetime.combine(day, parsed.time())
-    return paris_tz.localize(parsed)
+    point = paris_tz.localize(parsed, is_dst=True)
+    if previous is not None and point <= previous:
+        point = paris_tz.localize(parsed, is_dst=False)
+    return point
+
+
+def _house_api_path(house: str | None) -> str:
+    """selectedHouse comes as "/api/houses/{uuid}" or "/houses/{uuid}": add /api once."""
+    house = house or ""
+    if not house.startswith("/api/"):
+        if not house.startswith("/"):
+            house = "/" + house
+        house = "/api" + house
+    return house
 
 
 def _minutes(clock: str) -> int:
