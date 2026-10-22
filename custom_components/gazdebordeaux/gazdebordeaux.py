@@ -14,6 +14,8 @@ ME_URL = "https://life.gazdebordeaux.fr/api/users/me"
 INPUT_DATE_FORMAT = "%Y-%m-%d"
 # Interval of the load curve returned by the "day" scale
 CURVE_STEP = timedelta(minutes=30)
+# Months of the high season of seasonal off-peak hours (November to March)
+HIGH_SEASON_MONTHS = (11, 12, 1, 2, 3)
 
 # Browser-like headers. The WAF on life.gazdebordeaux.fr rejects requests that
 # don't look like the SPA (same-origin fetch from the web app).
@@ -54,6 +56,38 @@ class DailyUsageRead:
     price: float
     ratio: float
     temperature: float
+    # Peak / off-peak split, filled for HP/HC electricity contracts.
+    # contractPrice is the subscription share included in price.
+    isHphc: bool = False
+    consumptionHp: float = 0.0
+    consumptionHc: float = 0.0
+    priceHp: float = 0.0
+    priceHc: float = 0.0
+    contractPrice: float = 0.0
+
+
+# Off-peak ranges of a contract, as Life gives them: [["22:00", "6:00"], ...].
+# With seasonal off-peak hours, "high" applies from November to March.
+@dataclasses.dataclass
+class OffPeakTimes:
+    all: list
+    high: list
+    low: list
+
+    def ranges(self, day: date) -> list:
+        if self.high and self.low:
+            return self.high if day.month in HIGH_SEASON_MONTHS else self.low
+        return self.all
+
+    def is_offpeak(self, day: date, minute: int) -> bool:
+        for start, end in self.ranges(day):
+            first, last = _minutes(start), _minutes(end)
+            if first <= last:
+                if first <= minute < last:
+                    return True
+            elif minute >= first or minute < last:
+                return True
+        return False
 
 
 # ----------------------------------------------------------------------------
@@ -157,12 +191,50 @@ class Gazdebordeaux:
                     price=daily_data[d]["price"],
                     ratio=daily_data[d]["ratio"],
                     temperature=daily_data[d]["temperature"],
+                    isHphc=bool(daily_data[d].get("isHphc")),
+                    consumptionHp=daily_data[d].get("consumptionHp") or 0.0,
+                    consumptionHc=daily_data[d].get("consumptionHc") or 0.0,
+                    priceHp=daily_data[d].get("priceHp") or 0.0,
+                    priceHc=daily_data[d].get("priceHc") or 0.0,
+                    contractPrice=daily_data[d].get("contractPrice") or 0.0,
                 )
             )
 
+        # Some days of HP/HC contracts come with kwh and price at 0 while
+        # their peak / off-peak values are filled; Life's own totals add the
+        # two periods, so do the same.
+        for read in usage_reads:
+            if not read.isHphc:
+                continue
+            split = read.consumptionHp + read.consumptionHc
+            if split and abs(read.amountOfEnergy - split) > 0.05:
+                read.amountOfEnergy = split
+            if not read.price and (read.priceHp or read.priceHc):
+                read.price = read.priceHp + read.priceHc + read.contractPrice
+
         return usage_reads
 
-    async def async_get_hourly_usage(self, day: date) -> list[DailyUsageRead] | None:
+    async def async_get_offpeak_times(self) -> OffPeakTimes | None:
+        """Return the off-peak ranges of the selected house, if it has any."""
+        if self._selectedHouse is None:
+            await self.loadHouse()
+        house = self._selectedHouse or ""
+        if not house.startswith("/api/"):
+            house = "/api" + (house if house.startswith("/") else "/" + house)
+        data = await self._fetch_house(house)
+        if not isinstance(data, dict) or data.get("priceCategory") != "HPHC":
+            return None
+        times = OffPeakTimes(
+            all=data.get("offPeakTimes") or [],
+            high=data.get("offPeakTimesHighSeason") or [],
+            low=data.get("offPeakTimesLowSeason") or [],
+        )
+        Logger.debug("Off-peak times: %s", times)
+        return times if (times.all or (times.high and times.low)) else None
+
+    async def async_get_hourly_usage(
+        self, day: date, offpeak: OffPeakTimes | None = None
+    ) -> list[DailyUsageRead] | None:
         """Return the hourly reads of one day, or None if none are available.
 
         The "day" scale is what the Life web app uses for its day view: one
@@ -170,7 +242,8 @@ class Gazdebordeaux:
         average power in kW over the half hour ending at its key, from 00:00
         of the day to 00:00 of the next one (49 points). Each point becomes
         kW x 0.5 h at the start of its half hour; the first one belongs to
-        the day before and is dropped.
+        the day before and is dropped. With off-peak ranges, each half hour
+        also goes to consumptionHp or consumptionHc.
         """
         start = datetime(day.year, day.month, day.day)
         data = await self.async_get_data(start, start, "day")
@@ -208,7 +281,14 @@ class Gazdebordeaux:
                     temperature=0.0,
                 ),
             )
-            read.amountOfEnergy += _energy(value) * CURVE_STEP.total_seconds() / 3600
+            energy = _energy(value) * CURVE_STEP.total_seconds() / 3600
+            read.amountOfEnergy += energy
+            if offpeak is not None:
+                read.isHphc = True
+                if offpeak.is_offpeak(day, point.hour * 60 + point.minute):
+                    read.consumptionHc += energy
+                else:
+                    read.consumptionHp += energy
             read.volumeOfEnergy += value.get("volumeOfEnergy") or 0.0
             read.price += _price(value)
 
@@ -368,6 +448,13 @@ def _parse_point_time(key: str, day: date) -> datetime | None:
     if parsed.year == 1900:
         parsed = datetime.combine(day, parsed.time())
     return paris_tz.localize(parsed)
+
+
+def _minutes(clock: str) -> int:
+    """Minutes since midnight of "H:MM"; "24:00" and "23:59" end the day."""
+    hours, minutes = (int(x) for x in clock.split(":")[:2])
+    total = hours * 60 + minutes
+    return 1440 if total >= 1439 else total
 
 
 def _energy(value: dict) -> float:

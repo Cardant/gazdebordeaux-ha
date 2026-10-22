@@ -28,7 +28,7 @@ from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN, HOUSE, RESET_STATISTICS
-from .gazdebordeaux import DailyUsageRead, Gazdebordeaux, TotalUsageRead
+from .gazdebordeaux import DailyUsageRead, Gazdebordeaux, OffPeakTimes, TotalUsageRead
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +36,28 @@ _LOGGER = logging.getLogger(__name__)
 HOURLY_DAYS = 30
 # Hourly data of the last days may not be published yet: wait for it
 HOURLY_GRACE_DAYS = 3
+
+CONSUMPTION_ID = f"{DOMAIN}:energy_consumption"
+# (statistic_id, DailyUsageRead field, name, only for peak / off-peak contracts)
+SERIES = [
+    (f"{DOMAIN}:energy_cost", "price", "cost", False),
+    (CONSUMPTION_ID, "amountOfEnergy", "consumption", False),
+    (f"{DOMAIN}:volume", "volumeOfEnergy", "volume", False),
+    (f"{DOMAIN}:energy_consumption_hp", "consumptionHp", "peak consumption", True),
+    (f"{DOMAIN}:energy_consumption_hc", "consumptionHc", "off-peak consumption", True),
+    (f"{DOMAIN}:energy_cost_hp", "priceHp", "peak cost", True),
+    (f"{DOMAIN}:energy_cost_hc", "priceHc", "off-peak cost", True),
+]
+# HA has no monetary unit class: costs go with unit_class None
+SERIES_UNITS = {
+    "price": (None, CURRENCY_EURO),
+    "priceHp": (None, CURRENCY_EURO),
+    "priceHc": (None, CURRENCY_EURO),
+    "amountOfEnergy": ("energy", UnitOfEnergy.KILO_WATT_HOUR),
+    "consumptionHp": ("energy", UnitOfEnergy.KILO_WATT_HOUR),
+    "consumptionHc": ("energy", UnitOfEnergy.KILO_WATT_HOUR),
+    "volumeOfEnergy": ("volume", UnitOfVolume.CUBIC_METERS),
+}
 
 
 class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
@@ -124,21 +146,11 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
 
     async def _insert_statistics(self) -> None:
         """Insert gdb statistics."""
-        cost_statistic_id = f"{DOMAIN}:energy_cost"
-        consumption_statistic_id = f"{DOMAIN}:energy_consumption"
-        volume_statistic_id = f"{DOMAIN}:volume"
-        _LOGGER.debug(
-            "Updating Statistics for %s, %s and %s",
-            cost_statistic_id,
-            consumption_statistic_id,
-            volume_statistic_id,
-        )
-
         if self.reset:
             _LOGGER.debug("Resetting all statistics...")
 
-        all_ids = [cost_statistic_id, consumption_statistic_id, volume_statistic_id]
-        last_stats = {}
+        all_ids = [statistic_id for statistic_id, *_ in SERIES]
+        last_stats: dict[str, Any] = {}
         for statistic_id in all_ids:
             last_stats.update(
                 await get_instance(self.hass).async_add_executor_job(
@@ -146,19 +158,17 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
                 )
             )
 
+        offpeak = await self.api.async_get_offpeak_times()
+        hphc_ids = [statistic_id for statistic_id, _, _, hphc_only in SERIES if hphc_only]
+
         last_stat_ts = None
-        if consumption_statistic_id in last_stats:
-            last_stat_ts = last_stats[consumption_statistic_id][0]["start"]
-            # Rows written before the time zone fix start at hh:51 (Paris mean
-            # time): rebuild the whole series once, on the hour.
-            if datetime.fromtimestamp(last_stat_ts).minute != 0:
-                _LOGGER.warning("Rebuilding Gaz de Bordeaux statistics on whole hours")
-                get_instance(self.hass).async_clear_statistics(all_ids)
-                last_stat_ts = None
-            elif self.reset:
-                # The "reset statistics" option: rebuild everything, with the
-                # last HOURLY_DAYS days hour by hour
-                _LOGGER.warning("Rebuilding Gaz de Bordeaux statistics on request")
+        if CONSUMPTION_ID in last_stats:
+            last_stat_ts = last_stats[CONSUMPTION_ID][0]["start"]
+            rebuild = self._rebuild_reason(
+                last_stat_ts, offpeak is not None and not all(i in last_stats for i in hphc_ids)
+            )
+            if rebuild:
+                _LOGGER.warning("Rebuilding Gaz de Bordeaux statistics %s", rebuild)
                 get_instance(self.hass).async_clear_statistics(all_ids)
                 last_stat_ts = None
             self.reset = False
@@ -166,28 +176,30 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         if last_stat_ts is None:
             _LOGGER.debug("Updating statistic for the first time")
             daily_reads = await self._async_get_all_data()
-            cost_sum = consumption_sum = volume_sum = 0.0
+            sums = dict.fromkeys(all_ids, 0.0)
             hourly_from = datetime.now().date() - timedelta(days=HOURLY_DAYS)
         else:
             last_stat_date = datetime.fromtimestamp(last_stat_ts)
             _LOGGER.debug("Last stat found for %s...", last_stat_date.strftime("%Y-%m-%d %H:%M"))
             daily_reads = await self._async_get_recent_usage_reads(last_stat_ts)
-            cost_sum = cast(float, last_stats[cost_statistic_id][0]["sum"])
-            consumption_sum = cast(float, last_stats[consumption_statistic_id][0]["sum"])
-            volume_sum = cast(float, last_stats[volume_statistic_id][0]["sum"])
+            sums = {
+                statistic_id: cast(float, last_stats[statistic_id][0]["sum"])
+                if statistic_id in last_stats
+                else 0.0
+                for statistic_id in all_ids
+            }
             hourly_from = last_stat_date.date()
             if last_stat_date.hour == 0:
                 # A daily read sits at midnight: that day is complete
                 hourly_from += timedelta(days=1)
 
-        usage_reads = await self._async_with_hourly_reads(daily_reads, hourly_from)
+        usage_reads = await self._async_with_hourly_reads(daily_reads, hourly_from, offpeak)
         if not usage_reads:
             _LOGGER.debug("No recent usage/cost data. Skipping update")
             return
 
-        cost_statistics = []
-        consumption_statistics = []
-        volume_statistics = []
+        series = [s for s in SERIES if offpeak is not None or not s[3]]
+        statistics: dict[str, list[StatisticData]] = {s[0]: [] for s in series}
 
         for usage_read in usage_reads:
             start = usage_read.date
@@ -199,51 +211,39 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
 
             _LOGGER.debug("Importing data for %s...", start.strftime("%Y-%m-%d %H:%M"))
 
-            cost_sum += usage_read.price
-            consumption_sum += usage_read.amountOfEnergy
-            volume_sum += usage_read.volumeOfEnergy
+            for statistic_id, field, _, _ in series:
+                value = getattr(usage_read, field)
+                sums[statistic_id] += value
+                statistics[statistic_id].append(
+                    StatisticData(start=start, state=value, sum=sums[statistic_id])
+                )
 
-            cost_statistics.append(StatisticData(start=start, state=usage_read.price, sum=cost_sum))
-            consumption_statistics.append(
-                StatisticData(start=start, state=usage_read.amountOfEnergy, sum=consumption_sum)
+        for statistic_id, field, name, _ in series:
+            unit_class, unit = SERIES_UNITS[field]
+            metadata = StatisticMetaData(
+                mean_type=StatisticMeanType.NONE,
+                unit_class=unit_class,
+                has_sum=True,
+                name=f"Gaz de Bordeaux {name}",
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                unit_of_measurement=unit,
             )
-            volume_statistics.append(
-                StatisticData(start=start, state=usage_read.volumeOfEnergy, sum=volume_sum)
-            )
+            async_add_external_statistics(self.hass, metadata, statistics[statistic_id])
 
-        name_prefix = " ".join(("Gaz de Bordeaux",))
-
-        cost_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            unit_class=None,  # HA has no monetary unit class
-            has_sum=True,
-            name=f"{name_prefix} cost",
-            source=DOMAIN,
-            statistic_id=cost_statistic_id,
-            unit_of_measurement=CURRENCY_EURO,
-        )
-        consumption_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            unit_class="energy",
-            has_sum=True,
-            name=f"{name_prefix} consumption",
-            source=DOMAIN,
-            statistic_id=consumption_statistic_id,
-            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        )
-        volume_metadata = StatisticMetaData(
-            mean_type=StatisticMeanType.NONE,
-            unit_class="volume",
-            has_sum=True,
-            name=f"{name_prefix} volume",
-            source=DOMAIN,
-            statistic_id=volume_statistic_id,
-            unit_of_measurement=UnitOfVolume.CUBIC_METERS,
-        )
-
-        async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-        async_add_external_statistics(self.hass, consumption_metadata, consumption_statistics)
-        async_add_external_statistics(self.hass, volume_metadata, volume_statistics)
+    def _rebuild_reason(self, last_stat_ts: float, missing_hphc: bool) -> str | None:
+        """Tell why the existing statistics must be cleared and imported again."""
+        # Rows written before the time zone fix start at hh:51 (Paris mean
+        # time): rebuild the whole series once, on the hour.
+        if datetime.fromtimestamp(last_stat_ts).minute != 0:
+            return "on whole hours"
+        if missing_hphc:
+            return "with peak and off-peak series"
+        if self.reset:
+            # The "reset statistics" option: rebuild everything, with the
+            # last HOURLY_DAYS days hour by hour
+            return "on request"
+        return None
 
     async def _async_get_all_data(self) -> list[DailyUsageRead]:
         """Get all cost reads since account activation, at different resolutions by age.
@@ -261,7 +261,10 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         return usage_reads
 
     async def _async_with_hourly_reads(
-        self, daily_reads: list[DailyUsageRead], hourly_from: date
+        self,
+        daily_reads: list[DailyUsageRead],
+        hourly_from: date,
+        offpeak: OffPeakTimes | None = None,
     ) -> list[DailyUsageRead]:
         """Replace the daily reads from hourly_from on by hourly reads.
 
@@ -276,7 +279,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             if day < hourly_from:
                 reads.append(daily)
                 continue
-            hourly = await self.api.async_get_hourly_usage(day)
+            hourly = await self.api.async_get_hourly_usage(day, offpeak if daily.isHphc else None)
             if not hourly:
                 if day >= recent:
                     _LOGGER.debug("No hourly data yet for %s, waiting for it", day)
@@ -295,10 +298,15 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
                 )
                 reads.append(daily)
                 continue
-            # Spread the daily cost by consumption when the hours carry none
-            if not any(r.price for r in hourly) and daily.price and energy:
+            if any(r.price for r in hourly):
+                reads.extend(hourly)
+                continue
+            if daily.isHphc and offpeak is not None:
+                _split_peak_offpeak(day, daily, hourly)
+            else:
+                # Spread the daily cost by consumption when the hours carry none
                 for r in hourly:
-                    r.price = daily.price * r.amountOfEnergy / energy
+                    r.price = daily.price * r.amountOfEnergy / energy if energy else 0.0
             reads.extend(hourly)
         return reads
 
@@ -309,3 +317,35 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             datetime.fromtimestamp(last_stat_time),
             datetime.now(),
         )
+
+
+def _split_peak_offpeak(day: date, daily: DailyUsageRead, hourly: list[DailyUsageRead]) -> None:
+    """Price each hour at its own peak / off-peak rate.
+
+    The hours are already split by the contract's off-peak ranges; that split
+    must match the daily one. Each period's daily cost is then spread over
+    its own kWh, and the subscription evenly over the hours, so that the day
+    adds up exactly to the daily read.
+    """
+    offpeak_energy = sum(r.consumptionHc for r in hourly)
+    if abs(offpeak_energy - daily.consumptionHc) > 0.1 * daily.consumptionHc + 0.1:
+        _LOGGER.warning(
+            "Off-peak hours of %s add up to %.3f kWh, daily read says %.3f: "
+            "splitting each hour by the daily ratio",
+            day,
+            offpeak_energy,
+            daily.consumptionHc,
+        )
+        share = daily.consumptionHc / daily.amountOfEnergy if daily.amountOfEnergy else 0.0
+        for r in hourly:
+            r.consumptionHc = r.amountOfEnergy * share
+            r.consumptionHp = r.amountOfEnergy - r.consumptionHc
+    peak_energy = sum(r.consumptionHp for r in hourly)
+    offpeak_energy = sum(r.consumptionHc for r in hourly)
+    subscription = daily.contractPrice / len(hourly)
+    for r in hourly:
+        r.isHphc = True
+        r.priceHp = daily.priceHp * r.consumptionHp / peak_energy if peak_energy else 0.0
+        r.priceHc = daily.priceHc * r.consumptionHc / offpeak_energy if offpeak_energy else 0.0
+        r.contractPrice = subscription
+        r.price = r.priceHp + r.priceHc + subscription
