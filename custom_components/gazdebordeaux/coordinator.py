@@ -1,7 +1,7 @@
 """Coordinator to handle Opower connections."""
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import MappingProxyType
 from typing import Any, cast
 
@@ -13,7 +13,6 @@ from homeassistant.components.recorder.models import (
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
-    statistics_during_period,
 )
 from homeassistant.components.recorder.util import get_instance
 from homeassistant.const import (
@@ -32,6 +31,11 @@ from .const import DOMAIN, HOUSE, RESET_STATISTICS
 from .gazdebordeaux import DailyUsageRead, Gazdebordeaux, TotalUsageRead
 
 _LOGGER = logging.getLogger(__name__)
+
+# Days imported hour by hour on the first import (one API request per day)
+HOURLY_DAYS = 30
+# Hourly data of the last days may not be published yet: wait for it
+HOURLY_GRACE_DAYS = 3
 
 
 class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
@@ -133,41 +137,53 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         if self.reset:
             _LOGGER.debug("Resetting all statistics...")
 
-        last_stat = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, consumption_statistic_id, True, set()
-        )
-        if not last_stat:
-            _LOGGER.debug("Updating statistic for the first time")
-            usage_reads = await self._async_get_all_data()
-            cost_sum = 0.0
-            consumption_sum = 0.0
-            volume_sum = 0.0
-            last_stat_ts = None
-        else:
-            last_stat_ts = last_stat[consumption_statistic_id][0]["start"]  # type: ignore
-            last_stat_date = datetime.fromtimestamp(last_stat_ts)
-            _LOGGER.debug("Last stat found for %s...", last_stat_date.strftime("%Y-%m-%d"))
-            usage_reads = await self._async_get_recent_usage_reads(last_stat_ts)
-            if not usage_reads:
-                _LOGGER.debug("No recent usage/cost data. Skipping update")
-                return
-
-            stats = await get_instance(self.hass).async_add_executor_job(
-                statistics_during_period,
-                self.hass,
-                usage_reads[0].date,
-                None,
-                {cost_statistic_id, consumption_statistic_id, volume_statistic_id},
-                "day",
-                None,
-                {"state", "sum"},
+        all_ids = [cost_statistic_id, consumption_statistic_id, volume_statistic_id]
+        last_stats = {}
+        for statistic_id in all_ids:
+            last_stats.update(
+                await get_instance(self.hass).async_add_executor_job(
+                    get_last_statistics, self.hass, 1, statistic_id, True, {"sum"}
+                )
             )
-            # s:StatisticsRow =stats[cost_statistic_id][0]
 
-            cost_sum = cast(float, stats[cost_statistic_id][0]["sum"])  # type: ignore
-            consumption_sum = cast(float, stats[consumption_statistic_id][0]["sum"])  # type: ignore
-            volume_sum = cast(float, stats[volume_statistic_id][0]["sum"])  # type: ignore
-            # last_stat_ts = stats[cost_statistic_id][0]["start"]  # type: ignore
+        last_stat_ts = None
+        if consumption_statistic_id in last_stats:
+            last_stat_ts = last_stats[consumption_statistic_id][0]["start"]
+            # Rows written before the time zone fix start at hh:51 (Paris mean
+            # time): rebuild the whole series once, on the hour.
+            if datetime.fromtimestamp(last_stat_ts).minute != 0:
+                _LOGGER.warning("Rebuilding Gaz de Bordeaux statistics on whole hours")
+                get_instance(self.hass).async_clear_statistics(all_ids)
+                last_stat_ts = None
+            elif self.reset:
+                # The "reset statistics" option: rebuild everything, with the
+                # last HOURLY_DAYS days hour by hour
+                _LOGGER.warning("Rebuilding Gaz de Bordeaux statistics on request")
+                get_instance(self.hass).async_clear_statistics(all_ids)
+                last_stat_ts = None
+            self.reset = False
+
+        if last_stat_ts is None:
+            _LOGGER.debug("Updating statistic for the first time")
+            daily_reads = await self._async_get_all_data()
+            cost_sum = consumption_sum = volume_sum = 0.0
+            hourly_from = datetime.now().date() - timedelta(days=HOURLY_DAYS)
+        else:
+            last_stat_date = datetime.fromtimestamp(last_stat_ts)
+            _LOGGER.debug("Last stat found for %s...", last_stat_date.strftime("%Y-%m-%d %H:%M"))
+            daily_reads = await self._async_get_recent_usage_reads(last_stat_ts)
+            cost_sum = cast(float, last_stats[cost_statistic_id][0]["sum"])
+            consumption_sum = cast(float, last_stats[consumption_statistic_id][0]["sum"])
+            volume_sum = cast(float, last_stats[volume_statistic_id][0]["sum"])
+            hourly_from = last_stat_date.date()
+            if last_stat_date.hour == 0:
+                # A daily read sits at midnight: that day is complete
+                hourly_from += timedelta(days=1)
+
+        usage_reads = await self._async_with_hourly_reads(daily_reads, hourly_from)
+        if not usage_reads:
+            _LOGGER.debug("No recent usage/cost data. Skipping update")
+            return
 
         cost_statistics = []
         consumption_statistics = []
@@ -175,16 +191,13 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
 
         for usage_read in usage_reads:
             start = usage_read.date
-            if last_stat_ts is not None:
-                if start.timestamp() <= last_stat_ts:
-                    _LOGGER.debug("Skipping data for %s (timestamp)", start.strftime("%Y-%m-%d"))
-                    continue
-                # Same day, skip regardless of time (avoid multiple runs for the same day).
-                if start.date() == last_stat_date.date():
-                    _LOGGER.debug("Skipping data for %s (same date)", start.strftime("%Y-%m-%d"))
-                    continue
+            if last_stat_ts is not None and (
+                start.timestamp() <= last_stat_ts or start.date() < hourly_from
+            ):
+                _LOGGER.debug("Skipping data for %s (timestamp)", start.strftime("%Y-%m-%d %H:%M"))
+                continue
 
-            _LOGGER.debug("Importing data for %s...", start.strftime("%Y-%m-%d"))
+            _LOGGER.debug("Importing data for %s...", start.strftime("%Y-%m-%d %H:%M"))
 
             cost_sum += usage_read.price
             consumption_sum += usage_read.amountOfEnergy
@@ -246,6 +259,48 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         end = datetime.now()
         usage_reads = await self.api.async_get_daily_usage(start, end)
         return usage_reads
+
+    async def _async_with_hourly_reads(
+        self, daily_reads: list[DailyUsageRead], hourly_from: date
+    ) -> list[DailyUsageRead]:
+        """Replace the daily reads from hourly_from on by hourly reads.
+
+        A day whose hours do not add up to its daily read keeps the daily
+        read. A recent day without hours yet stops the import there, so the
+        next update picks it up hour by hour once Enedis has published it.
+        """
+        reads: list[DailyUsageRead] = []
+        recent = datetime.now().date() - timedelta(days=HOURLY_GRACE_DAYS)
+        for daily in sorted(daily_reads, key=lambda r: r.date):
+            day = daily.date.date()
+            if day < hourly_from:
+                reads.append(daily)
+                continue
+            hourly = await self.api.async_get_hourly_usage(day)
+            if not hourly:
+                if day >= recent:
+                    _LOGGER.debug("No hourly data yet for %s, waiting for it", day)
+                    break
+                _LOGGER.debug("No hourly data for %s, keeping the daily read", day)
+                reads.append(daily)
+                continue
+            energy = sum(r.amountOfEnergy for r in hourly)
+            if abs(energy - daily.amountOfEnergy) > 0.1 * daily.amountOfEnergy + 0.05:
+                _LOGGER.warning(
+                    "Hourly reads of %s add up to %.3f kWh, daily read says %.3f: "
+                    "keeping the daily read",
+                    day,
+                    energy,
+                    daily.amountOfEnergy,
+                )
+                reads.append(daily)
+                continue
+            # Spread the daily cost by consumption when the hours carry none
+            if not any(r.price for r in hourly) and daily.price and energy:
+                for r in hourly:
+                    r.price = daily.price * r.amountOfEnergy / energy
+            reads.extend(hourly)
+        return reads
 
     async def _async_get_recent_usage_reads(self, last_stat_time: float) -> list[DailyUsageRead]:
         """Get cost reads within the past 30 days to allow corrections in data from utilities."""

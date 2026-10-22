@@ -1,6 +1,6 @@
 import dataclasses
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from json.decoder import JSONDecodeError
 from typing import Any
 
@@ -12,6 +12,8 @@ LOGIN_URL = "https://life.gazdebordeaux.fr/api/login_check"
 ME_URL = "https://life.gazdebordeaux.fr/api/users/me"
 
 INPUT_DATE_FORMAT = "%Y-%m-%d"
+# Interval of the load curve returned by the "day" scale
+CURVE_STEP = timedelta(minutes=30)
 
 # Browser-like headers. The WAF on life.gazdebordeaux.fr rejects requests that
 # don't look like the SPA (same-origin fetch from the web app).
@@ -147,7 +149,9 @@ class Gazdebordeaux:
                 continue
             usage_reads.append(
                 DailyUsageRead(
-                    date=datetime.strptime(d, INPUT_DATE_FORMAT).replace(tzinfo=paris_tz),
+                    # localize(), not replace(): pytz's replace() picks Paris
+                    # mean time (+00:09) and puts every day at 23:51 UTC
+                    date=paris_tz.localize(datetime.strptime(d, INPUT_DATE_FORMAT)),
                     amountOfEnergy=daily_data[d]["kwh"],
                     volumeOfEnergy=daily_data[d]["volumeOfEnergy"],
                     price=daily_data[d]["price"],
@@ -157,6 +161,58 @@ class Gazdebordeaux:
             )
 
         return usage_reads
+
+    async def async_get_hourly_usage(self, day: date) -> list[DailyUsageRead] | None:
+        """Return the hourly reads of one day, or None if none are available.
+
+        The "day" scale is what the Life web app uses for its day view: one
+        request per day. It returns the Enedis load curve: each point is the
+        average power in kW over the half hour ending at its key, from 00:00
+        of the day to 00:00 of the next one (49 points). Each point becomes
+        kW x 0.5 h at the start of its half hour; the first one belongs to
+        the day before and is dropped.
+        """
+        start = datetime(day.year, day.month, day.day)
+        data = await self.async_get_data(start, start, "day")
+        Logger.debug("Hourly usage raw response for %s: %s", day, data)
+
+        if not isinstance(data, dict):
+            return None
+
+        hours: dict[datetime, DailyUsageRead] = {}
+        for key, value in data.items():
+            if key == "total" or not isinstance(value, dict):
+                continue
+            point = _parse_point_time(key, day)
+            if point is None:
+                sample = {k: data[k] for k in list(data)[:2]}
+                Logger.warning(
+                    "Unexpected hourly key %r for %s, keeping the daily read. Sample: %s",
+                    key,
+                    day,
+                    sample,
+                )
+                return None
+            point = paris_tz.normalize(point - CURVE_STEP)
+            if point.date() != day:
+                continue
+            hour = paris_tz.normalize(point.replace(minute=0))
+            read = hours.setdefault(
+                hour,
+                DailyUsageRead(
+                    date=hour,
+                    amountOfEnergy=0.0,
+                    volumeOfEnergy=0.0,
+                    price=0.0,
+                    ratio=0.0,
+                    temperature=0.0,
+                ),
+            )
+            read.amountOfEnergy += _energy(value) * CURVE_STEP.total_seconds() / 3600
+            read.volumeOfEnergy += value.get("volumeOfEnergy") or 0.0
+            read.price += _price(value)
+
+        return [hours[h] for h in sorted(hours)] or None
 
     async def async_get_data(self, start: datetime | None, end: datetime | None, scale: str) -> Any:
         try:
@@ -274,3 +330,53 @@ class Gazdebordeaux:
         Logger.debug("Fetching house %s", url)
         async with self._session.get(url, headers=self._authenticated_headers()) as response:
             return await response.json(content_type=None)
+
+
+# ----------------------------------------------------------------------------
+_POINT_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M",
+    "%H:%M:%S",
+    "%H:%M",
+)
+
+
+def _parse_point_time(key: str, day: date) -> datetime | None:
+    """Turn a key of the "day" scale into an aware Paris datetime.
+
+    The format is not documented; accept the usual ones and reject a bare
+    date, which would mean the API answered with daily points.
+    """
+    try:
+        parsed = datetime.fromisoformat(key)
+    except ValueError:
+        parsed = None
+    if parsed is not None and parsed.tzinfo is not None:
+        return parsed.astimezone(paris_tz)
+    if parsed is None or len(key) <= len("YYYY-MM-DD"):
+        parsed = None
+        for fmt in _POINT_FORMATS:
+            try:
+                parsed = datetime.strptime(key, fmt)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return None
+    if parsed.year == 1900:
+        parsed = datetime.combine(day, parsed.time())
+    return paris_tz.localize(parsed)
+
+
+def _energy(value: dict) -> float:
+    if value.get("kwh") is not None:
+        return float(value["kwh"])
+    return float(value.get("consumptionHp") or 0.0) + float(value.get("consumptionHc") or 0.0)
+
+
+def _price(value: dict) -> float:
+    if value.get("price") is not None:
+        return float(value["price"])
+    return float(value.get("priceHp") or 0.0) + float(value.get("priceHc") or 0.0)
