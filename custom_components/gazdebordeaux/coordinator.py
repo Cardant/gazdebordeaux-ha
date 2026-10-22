@@ -92,6 +92,8 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
 
         # Initialisation de la date de dernière actualisation
         self.last_update: datetime | None = None
+        # Statistics import running in the background, see _async_update_data
+        self._statistics_task: asyncio.Task | None = None
 
         house: Any = None
         if HOUSE in entry_data:
@@ -147,14 +149,27 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         total_usage: TotalUsageRead = await self.api.async_get_total_usage()
 
         # Because Opower provides historical usage/cost with a delay of a couple of days
-        # we need to insert data into statistics.
-        await self._insert_statistics()
+        # we need to insert data into statistics. A full import asks for one
+        # day of load curve per request and can take minutes: run it in the
+        # background so that it does not hold the config entry setup (which
+        # Home Assistant cancels after a while) nor the sensors.
+        if self._statistics_task is None or self._statistics_task.done():
+            self._statistics_task = self.hass.async_create_background_task(
+                self._async_insert_statistics_logged(), "gazdebordeaux statistics import"
+            )
 
         # Mise à jour de la date de dernière actualisation
         self.last_update = datetime.now()
         _LOGGER.debug("Last update: %s", self.last_update.strftime("%Y-%m-%d %H:%M:%S"))
 
         return total_usage
+
+    async def _async_insert_statistics_logged(self) -> None:
+        """Run _insert_statistics, logging its failure; the next update retries."""
+        try:
+            await self._insert_statistics()
+        except Exception:
+            _LOGGER.exception("Importing Gaz de Bordeaux statistics failed")
 
     async def _insert_statistics(self) -> None:
         """Insert gdb statistics."""

@@ -7,25 +7,31 @@ the recorder is exercised.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import date, datetime, timedelta
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from homeassistant.components.recorder.statistics import statistics_during_period
 from homeassistant.components.recorder.util import get_instance
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 from pytest_homeassistant_custom_component.components.recorder.common import (
     async_wait_recording_done,
 )
 
 from custom_components.gazdebordeaux import coordinator as coordinator_module
+from custom_components.gazdebordeaux.const import DOMAIN
 from custom_components.gazdebordeaux.coordinator import GdbCoordinator
 from custom_components.gazdebordeaux.gazdebordeaux import (
     Gazdebordeaux,
     HouseDetails,
     OffPeakTimes,
+    TotalUsageRead,
     paris_tz,
 )
 
@@ -245,3 +251,33 @@ async def test_resume_after_a_daily_read_with_a_utc_process(
     assert rows[CONSUMPTION][-1]["sum"] == pytest.approx(12.0 * day_count)
     for day, day_rows in _days(rows[CONSUMPTION]).items():
         assert sum(r["state"] for r in day_rows) == pytest.approx(12.0), day
+
+
+async def test_setup_does_not_wait_for_the_statistics_import(hass: HomeAssistant) -> None:
+    # A full import can take minutes; Home Assistant cancels a setup that
+    # long, so the import runs in the background
+    entry = MockConfigEntry(
+        domain=DOMAIN, data={CONF_USERNAME: "user@example.com", CONF_PASSWORD: "x"}
+    )
+    entry.add_to_hass(hass)
+    release = asyncio.Event()
+    imported = []
+
+    async def slow_import(self: GdbCoordinator) -> None:
+        await release.wait()
+        imported.append(True)
+
+    canned = TotalUsageRead(amountOfEnergy=1.0, volumeOfEnergy=0.0, price=1.0)
+    with (
+        patch.object(Gazdebordeaux, "async_login", new=AsyncMock(return_value=None)),
+        patch.object(Gazdebordeaux, "async_get_total_usage", new=AsyncMock(return_value=canned)),
+        patch.object(GdbCoordinator, "_insert_statistics", new=slow_import),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        assert entry.state is ConfigEntryState.LOADED
+        assert not imported
+
+        release.set()
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert imported == [True]
