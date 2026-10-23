@@ -32,6 +32,7 @@ from .const import DOMAIN, HOUSE, RESET_STATISTICS
 from .gazdebordeaux import (
     DailyUsageRead,
     Gazdebordeaux,
+    HouseDetails,
     OffPeakTimes,
     TotalUsageRead,
     paris_tz,
@@ -39,9 +40,6 @@ from .gazdebordeaux import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Days imported hour by hour on the first import (one API request per day)
-# when the house does not tell when its load curve starts
-HOURLY_DAYS = 30
 # Life keeps the load curve for two years
 HOURLY_MAX_DAYS = 730
 # Pause between two hourly requests, to stay gentle with Life's edge filter
@@ -185,7 +183,12 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
                 )
             )
 
-        house = await self.api.async_get_house_details()
+        try:
+            house = await self.api.async_get_house_details()
+        except Exception:
+            # Without it, the import goes on daily as before this resource was read
+            _LOGGER.warning("Could not read the house details", exc_info=True)
+            house = HouseDetails(offpeak=None, hourly_start=None)
         offpeak = house.offpeak
         hphc_ids = [statistic_id for statistic_id, _, _, hphc_only in SERIES if hphc_only]
         has_hphc = all(i in last_stats for i in hphc_ids)
@@ -227,7 +230,9 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
                 # A daily read sits at midnight: that day is complete
                 hourly_from += timedelta(days=1)
 
-        usage_reads = await self._async_with_hourly_reads(daily_reads, hourly_from, offpeak)
+        usage_reads = await self._async_with_hourly_reads(
+            daily_reads, hourly_from, offpeak, house.hourly_start
+        )
         if not usage_reads:
             _LOGGER.debug("No recent usage/cost data. Skipping update")
             return
@@ -301,10 +306,14 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
 
     @staticmethod
     def _first_hourly_day(hourly_start: date | None) -> date:
-        """First day to import hour by hour on a full import."""
+        """First day to import hour by hour on a full import.
+
+        Without a load curve (gas, or electricity without half-hourly
+        readings), that is never: everything stays daily.
+        """
         today = datetime.now(paris_tz).date()
         if hourly_start is None:
-            return today - timedelta(days=HOURLY_DAYS)
+            return today + timedelta(days=1)
         return max(hourly_start, today - timedelta(days=HOURLY_MAX_DAYS))
 
     async def _async_get_all_data(self) -> list[DailyUsageRead]:
@@ -326,8 +335,12 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         daily_reads: list[DailyUsageRead],
         hourly_from: date,
         offpeak: OffPeakTimes | None = None,
+        hourly_start: date | None = None,
     ) -> list[DailyUsageRead]:
         """Replace the daily reads from hourly_from on by hourly reads.
+
+        Only days covered by the load curve (from hourly_start on) are asked
+        hour by hour; without a curve, every day stays daily.
 
         A day whose hours do not add up to its daily read keeps the daily
         read. A recent day without hours yet stops the import there, so the
@@ -338,7 +351,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         requested = False
         for daily in sorted(daily_reads, key=lambda r: r.date):
             day = daily.date.date()
-            if day < hourly_from:
+            if day < hourly_from or hourly_start is None or day < hourly_start:
                 reads.append(daily)
                 continue
             if requested:

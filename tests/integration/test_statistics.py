@@ -232,8 +232,8 @@ async def test_resume_after_a_daily_read_with_a_utc_process(
     monkeypatch.setenv("TZ", "UTC")
     time.tzset()
     try:
-        api = FakeApi(hourly_start=None)
-        api.hourly_until = date(2000, 1, 1)  # no load curve yet: daily reads only
+        api = FakeApi(hourly_start=datetime.now(paris_tz).date() - timedelta(days=10))
+        api.hourly_until = date(2000, 1, 1)  # curve not published yet: daily reads
         coordinator = _coordinator(hass, api)
         await coordinator._insert_statistics()
         first = await _rows(hass)
@@ -281,3 +281,30 @@ async def test_setup_does_not_wait_for_the_statistics_import(hass: HomeAssistant
         await hass.async_block_till_done(wait_background_tasks=True)
 
     assert imported == [True]
+
+
+async def test_account_without_load_curve_stays_daily(hass: HomeAssistant) -> None:
+    # Gas, or electricity without half-hourly readings: no hourly request,
+    # and the latest daily reads are imported at once, as before
+    api = FakeApi(hourly_start=None, offpeak=None)
+    await _coordinator(hass, api)._insert_statistics()
+    rows = await _rows(hass)
+
+    assert api.hourly_requests == 0
+    days = _days(rows[CONSUMPTION])
+    assert all(len(r) == 1 for r in days.values())
+    assert max(days) == api.last_day
+    assert set(rows) == {COST, CONSUMPTION, "gazdebordeaux:volume"}
+
+
+async def test_house_details_failure_falls_back_to_daily(hass: HomeAssistant) -> None:
+    api = FakeApi(hourly_start=None, offpeak=None)
+
+    async def broken() -> HouseDetails:
+        raise Exception("Data response was not JSON (status=403)")
+
+    api.async_get_house_details = broken  # type: ignore[method-assign]
+    await _coordinator(hass, api)._insert_statistics()
+    rows = await _rows(hass)
+
+    assert max(_days(rows[CONSUMPTION])) == api.last_day
