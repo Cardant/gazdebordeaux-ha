@@ -357,7 +357,9 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             if requested:
                 await asyncio.sleep(HOURLY_REQUEST_DELAY)
             requested = True
-            hourly = await self.api.async_get_hourly_usage(day, offpeak if daily.isHphc else None)
+            hourly = await self.api.async_get_hourly_usage(
+                day, offpeak if daily.isHphc else None, daily.amountOfEnergy
+            )
             if not hourly:
                 if day >= recent:
                     _LOGGER.debug("No hourly data yet for %s, waiting for it", day)

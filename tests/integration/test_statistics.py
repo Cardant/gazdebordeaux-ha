@@ -146,6 +146,13 @@ def _days(rows: list[dict]) -> dict[date, list[dict]]:
     return by_day
 
 
+def _hours_in(day: date) -> int:
+    """23, 24 or 25: the clock changes fall in any ten-day window."""
+    start = paris_tz.localize(datetime(day.year, day.month, day.day))
+    end = paris_tz.localize(datetime.combine(day + timedelta(days=1), datetime.min.time()))
+    return round((end - start).total_seconds() / 3600)
+
+
 async def test_first_import_hourly_since_curve_start(hass: HomeAssistant) -> None:
     api = FakeApi(hourly_start=datetime.now(paris_tz).date() - timedelta(days=10))
     await _coordinator(hass, api)._insert_statistics()
@@ -156,7 +163,7 @@ async def test_first_import_hourly_since_curve_start(hass: HomeAssistant) -> Non
     hourly_days = sorted(d for d, r in days.items() if len(r) > 1)
     assert hourly_days[0] == api.hourly_start
     assert hourly_days[-1] == api.last_day
-    assert all(len(days[d]) == 24 for d in hourly_days)
+    assert all(len(days[d]) == _hours_in(d) for d in hourly_days)
     first_day = date(api.today.year - 1, 1, 1)
     day_count = (api.last_day - first_day).days + 1
     assert rows[CONSUMPTION][-1]["sum"] == pytest.approx(12.0 * day_count)
@@ -164,7 +171,7 @@ async def test_first_import_hourly_since_curve_start(hass: HomeAssistant) -> Non
     assert rows[COST][-1]["sum"] == pytest.approx(DAY_PRICE * day_count)
     # Each hour at its own rate, the subscription spread over the day
     noon = next(r for r in _days(rows[COST])[api.last_day] if r["start"] % 86400 == 10 * 3600)
-    assert noon["state"] == pytest.approx(0.5 * P_HP + SUBSCRIPTION / 24)
+    assert noon["state"] == pytest.approx(0.5 * P_HP + SUBSCRIPTION / _hours_in(api.last_day))
 
 
 async def test_second_update_adds_nothing_twice(hass: HomeAssistant) -> None:

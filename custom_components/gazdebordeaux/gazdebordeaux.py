@@ -254,7 +254,10 @@ class Gazdebordeaux:
         return details
 
     async def async_get_hourly_usage(
-        self, day: date, offpeak: OffPeakTimes | None = None
+        self,
+        day: date,
+        offpeak: OffPeakTimes | None = None,
+        daily_energy: float | None = None,
     ) -> list[DailyUsageRead] | None:
         """Return the hourly reads of one day, or None if none are available.
 
@@ -265,6 +268,11 @@ class Gazdebordeaux:
         kW x 0.5 h at the start of its half hour; the first one belongs to
         the day before and is dropped. With off-peak ranges, each half hour
         also goes to consumptionHp or consumptionHc.
+
+        On the October change the day has 25 hours but the curve still has 49
+        points: the naive keys of the repeated 02:00-03:00 hour collide and
+        one of each pair is lost. With daily_energy, the two missing half
+        hours share what the curve lacks to reach the daily read.
         """
         start = datetime(day.year, day.month, day.day)
         data = await self.async_get_data(start, start, "day")
@@ -273,7 +281,7 @@ class Gazdebordeaux:
         if not isinstance(data, dict):
             return None
 
-        hours: dict[datetime, DailyUsageRead] = {}
+        halves: list[tuple[datetime, float, dict]] = []
         previous: datetime | None = None
         for key, value in data.items():
             if key == "total" or not isinstance(value, dict):
@@ -292,6 +300,13 @@ class Gazdebordeaux:
             point = paris_tz.normalize(point - CURVE_STEP)
             if point.date() != day:
                 continue
+            halves.append((point, _energy(value) * CURVE_STEP.total_seconds() / 3600, value))
+
+        if daily_energy is not None:
+            halves.extend(_repeated_hour_halves(day, halves, daily_energy))
+
+        hours: dict[datetime, DailyUsageRead] = {}
+        for point, energy, value in sorted(halves, key=lambda h: h[0]):
             hour = paris_tz.normalize(point.replace(minute=0))
             read = hours.setdefault(
                 hour,
@@ -304,7 +319,6 @@ class Gazdebordeaux:
                     temperature=0.0,
                 ),
             )
-            energy = _energy(value) * CURVE_STEP.total_seconds() / 3600
             read.amountOfEnergy += energy
             if offpeak is not None:
                 read.isHphc = True
@@ -470,6 +484,35 @@ def _parse_point_time(key: str, day: date, previous: datetime | None = None) -> 
     if previous is not None and point <= previous:
         point = paris_tz.localize(parsed, is_dst=False)
     return point
+
+
+def _repeated_hour_halves(
+    day: date, halves: list[tuple[datetime, float, dict]], daily_energy: float
+) -> list[tuple[datetime, float, dict]]:
+    """Half hours of the repeated October hour that the curve lost.
+
+    They share what the curve lacks to reach the daily read. Only up to two
+    of them, all between 02:00 and 03:00, and none above the day's highest
+    half hour: anything else is a real gap, left to the daily read check.
+    """
+    midnight = paris_tz.localize(datetime(day.year, day.month, day.day))
+    next_day = day + timedelta(days=1)
+    end = paris_tz.localize(datetime(next_day.year, next_day.month, next_day.day))
+    if end - midnight <= timedelta(hours=24) or not halves:
+        return []
+    present = {point for point, _, _ in halves}
+    missing = []
+    point = midnight
+    while point < end:
+        if point not in present:
+            missing.append(paris_tz.normalize(point))
+        point += CURVE_STEP
+    if not missing or len(missing) > 2 or any(p.hour != 2 for p in missing):
+        return []
+    share = (daily_energy - sum(energy for _, energy, _ in halves)) / len(missing)
+    if share <= 0 or share > max(energy for _, energy, _ in halves):
+        return []
+    return [(p, share, {}) for p in missing]
 
 
 def _house_api_path(house: str | None) -> str:

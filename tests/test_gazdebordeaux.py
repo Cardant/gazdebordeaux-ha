@@ -229,6 +229,45 @@ async def test_hourly_usage_october_change_keeps_hours_distinct(http_mock, sessi
     assert abs(sum(h.amountOfEnergy for h in hours) - 12.0) < 1e-9
 
 
+async def test_hourly_usage_october_change_fills_the_lost_half_hours(http_mock, session):
+    # Same 49 points; the daily read says 12.5 kWh: the two half hours lost
+    # in the repeated hour share the missing 0.5 kWh
+    day = date(2026, 10, 25)
+    http_mock.get(DAY_URL, payload=_curve(day))
+    offpeak = OffPeakTimes(all=[["1:00", "6:00"]], high=[], low=[])
+
+    api = Gazdebordeaux(session, USERNAME, PASSWORD, token=TOKEN, house=HOUSE_PATH)
+    hours = await api.async_get_hourly_usage(day, offpeak, daily_energy=12.5)
+
+    assert hours is not None
+    assert len({h.date.timestamp() for h in hours}) == len(hours) == 25
+    assert all(abs(h.amountOfEnergy - 0.5) < 1e-9 for h in hours)
+    two_am = [h for h in hours if h.date.hour == 2]
+    assert [h.date.isoformat() for h in two_am] == [
+        "2026-10-25T02:00:00+02:00",
+        "2026-10-25T02:00:00+01:00",
+    ]
+    assert all(abs(h.consumptionHc - 0.5) < 1e-9 for h in two_am)
+
+
+@pytest.mark.parametrize(
+    ("day", "daily_energy"),
+    [
+        (date(2026, 10, 25), 20.0),  # more than the day's highest half hour
+        (date(2026, 10, 25), 11.0),  # nothing lacks
+        (date(2026, 10, 20), 12.5),  # a 24 hour day
+    ],
+)
+async def test_hourly_usage_leaves_other_gaps_alone(http_mock, session, day, daily_energy):
+    http_mock.get(DAY_URL, payload=_curve(day))
+
+    api = Gazdebordeaux(session, USERNAME, PASSWORD, token=TOKEN, house=HOUSE_PATH)
+    hours = await api.async_get_hourly_usage(day, daily_energy=daily_energy)
+
+    assert hours is not None
+    assert abs(sum(h.amountOfEnergy for h in hours) - 12.0) < 1e-9
+
+
 async def test_hourly_usage_march_change(http_mock, session):
     # 2026-03-29: clocks go forward at 02:00, the day has 23 hours
     day = date(2026, 3, 29)
