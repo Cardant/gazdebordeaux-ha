@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Import the cost statistic with `unit_class=None`: Home Assistant has no `"monetary"` unit class and rejected the whole import with "Unsupported unit_class: 'monetary'" (#47)
 - Import the consumption hour by hour from the Enedis load curve (`scale=day`, half-hourly average power in kW), from the curve's start (`hourlyMeasureStartDate`, at most two years back) on a full import, then day after day; a day whose hours do not add up to its daily read keeps the daily read
 - On the October clock change, fill the repeated 02:00-03:00 hour the load curve loses (its naive keys collide, leaving 49 points for 25 hours) with what the curve lacks to reach the daily read, so the day is imported hour by hour too
+- Poll Life every hour while the day it should publish next is missing, every 12 hours otherwise: Life publishes each day's reads two days later, during the day, so a 12 hour pace left Home Assistant up to 12 hours behind it
 - Peak / off-peak (HP/HC) contracts: four more statistics, `energy_consumption_hp`, `energy_consumption_hc`, `energy_cost_hp` and `energy_cost_hc`, with each half hour split by the contract's off-peak ranges (seasonal ones included) and priced at its own rate
 - Count `consumptionHp + consumptionHc` for HP/HC days that come with `kwh` and `price` at 0, as Life's own totals do
 - Start daily statistics at local midnight: pytz's `replace(tzinfo=...)` put every day at 23:51 UTC (Paris mean time); existing series are rebuilt once, on the hour

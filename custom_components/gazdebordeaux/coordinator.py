@@ -46,6 +46,11 @@ HOURLY_MAX_DAYS = 730
 HOURLY_REQUEST_DELAY = 0.2
 # Hourly data of the last days may not be published yet: wait for it
 HOURLY_GRACE_DAYS = 3
+# Life publishes each day's reads two days later, during the day
+PUBLICATION_DELAY = timedelta(days=2)
+# Usual pace, and the one while the day Life should publish next is missing
+UPDATE_INTERVAL = timedelta(hours=12)
+WAITING_UPDATE_INTERVAL = timedelta(hours=1)
 
 CONSUMPTION_ID = f"{DOMAIN}:energy_consumption"
 # (statistic_id, DailyUsageRead field, name, only for peak / off-peak contracts)
@@ -83,15 +88,17 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             hass,
             _LOGGER,
             name="gazdebordeaux",
-            # Data is updated daily.
-            # Refresh every 12h to be at most 12h behind.
-            update_interval=timedelta(hours=12),
+            # Every 12 hours, or every hour while the next day is due:
+            # see _next_update_interval
+            update_interval=UPDATE_INTERVAL,
         )
 
         # Initialisation de la date de dernière actualisation
         self.last_update: datetime | None = None
         # Statistics import running in the background, see _async_update_data
         self._statistics_task: asyncio.Task | None = None
+        # Day of the last imported statistic, known once an import has run
+        self._last_day: date | None = None
 
         house: Any = None
         if HOUSE in entry_data:
@@ -136,9 +143,11 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         self,
     ) -> TotalUsageRead:
         """Fetch data from API endpoint."""
+        # Applies to the next update, scheduled once this one returns
+        self.update_interval = self._next_update_interval()
         try:
             # Login expires after a few minutes.
-            # Given the infrequent updating (every 12h)
+            # Given the infrequent updating (hourly at most)
             # assume previous session has expired and re-login.
             await self.api.async_login()
         except Exception as err:
@@ -197,6 +206,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
         rebuild = None
         if CONSUMPTION_ID in last_stats:
             last_stat_ts = last_stats[CONSUMPTION_ID][0]["start"]
+            self._last_day = datetime.fromtimestamp(last_stat_ts, paris_tz).date()
             rebuild = self._rebuild_reason(last_stat_ts, offpeak is not None and not has_hphc)
             if rebuild is None and offpeak is None and has_hphc:
                 # Writing the other series alone would leave a hole in the
@@ -246,6 +256,7 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
 
         series = [s for s in SERIES if offpeak is not None or not s[3]]
         self._write_statistics(series, usage_reads, sums, last_stat_ts, hourly_from)
+        self._last_day = usage_reads[-1].date.date()
         # Cleared once the import it asked for has happened
         self.reset = False
 
@@ -303,6 +314,21 @@ class GdbCoordinator(DataUpdateCoordinator[TotalUsageRead]):
             # load curve hour by hour
             return "on request"
         return None
+
+    def _next_update_interval(self) -> timedelta:
+        """Poll hourly while the day Life should publish next is missing.
+
+        Life publishes each day's reads two days later, during the day. When
+        more than that day is missing, Life itself is late: keep the usual
+        pace rather than ask every hour for days.
+        """
+        if self._last_day is None:
+            # Not known before the first import: look again soon
+            return WAITING_UPDATE_INTERVAL
+        expected = datetime.now(paris_tz).date() - PUBLICATION_DELAY
+        if self._last_day == expected - timedelta(days=1):
+            return WAITING_UPDATE_INTERVAL
+        return UPDATE_INTERVAL
 
     @staticmethod
     def _first_hourly_day(hourly_start: date | None) -> date:
